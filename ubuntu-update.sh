@@ -19,6 +19,68 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# Docker 컨테이너 헬스체크 대기 함수
+wait_for_healthy() {
+    local compose_path=$1
+    local max_wait=${2:-300}  # 기본 최대 대기 시간: 5분
+    local interval=5
+    local elapsed=0
+
+    log_info "컨테이너 초기화 대기 중..."
+
+    # 컨테이너 목록 가져오기
+    local containers=$(docker-compose -f "$compose_path" ps -q)
+
+    if [ -z "$containers" ]; then
+        log_warn "실행 중인 컨테이너가 없습니다."
+        return 0
+    fi
+
+    while [ $elapsed -lt $max_wait ]; do
+        local all_healthy=true
+        local status_info=""
+
+        for container in $containers; do
+            local health=$(docker inspect --format='{{.State.Health.Status}}' "$container" 2>/dev/null || echo "none")
+            local status=$(docker inspect --format='{{.State.Status}}' "$container" 2>/dev/null || echo "unknown")
+            local name=$(docker inspect --format='{{.Name}}' "$container" 2>/dev/null | sed 's/\///')
+
+            # health check가 정의되지 않은 경우
+            if [ "$health" = "none" ] || [ "$health" = "<no value>" ]; then
+                # running 상태면 OK
+                if [ "$status" != "running" ]; then
+                    all_healthy=false
+                    status_info="${status_info}\n  - $name: $status (not running)"
+                else
+                    status_info="${status_info}\n  - $name: running (no healthcheck)"
+                fi
+            else
+                # health check가 있는 경우
+                if [ "$health" != "healthy" ]; then
+                    all_healthy=false
+                    status_info="${status_info}\n  - $name: $health"
+                else
+                    status_info="${status_info}\n  - $name: healthy"
+                fi
+            fi
+        done
+
+        if [ "$all_healthy" = true ]; then
+            log_info "모든 컨테이너가 정상 상태입니다!"
+            echo -e "$status_info"
+            return 0
+        fi
+
+        echo -ne "\r대기 중... ${elapsed}/${max_wait}초 경과"
+        sleep $interval
+        elapsed=$((elapsed + interval))
+    done
+
+    log_warn "최대 대기 시간(${max_wait}초) 초과. 현재 상태:"
+    echo -e "$status_info"
+    return 1
+}
+
 # 스크립트 실행 디렉토리
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -31,6 +93,45 @@ fi
 
 log_info "=== 시스템 업데이트 스크립트 시작 ==="
 log_info "작업 디렉토리: $SCRIPT_DIR"
+
+# 0. Git 저장소 업데이트 확인 및 자동 재실행
+log_info "Step 0: 스크립트 업데이트 확인"
+
+if [ -d "$SCRIPT_DIR/.git" ]; then
+    log_info "Git 저장소에서 최신 버전 확인 중..."
+
+    cd "$SCRIPT_DIR" || {
+        log_error "작업 디렉토리로 이동 실패"
+        exit 1
+    }
+
+    # 현재 커밋 해시 저장
+    CURRENT_COMMIT=$(git rev-parse HEAD 2>/dev/null)
+
+    # git pull 실행
+    if git pull origin main 2>&1 | tee /tmp/git-pull-output.log; then
+        # pull 후 커밋 해시 확인
+        NEW_COMMIT=$(git rev-parse HEAD 2>/dev/null)
+
+        if [ "$CURRENT_COMMIT" != "$NEW_COMMIT" ]; then
+            log_info "스크립트가 업데이트되었습니다!"
+            log_info "새 버전으로 재실행합니다..."
+            echo ""
+
+            # 스크립트 재실행 (모든 인자 전달)
+            exec "$0" "$@"
+        else
+            log_info "이미 최신 버전입니다."
+        fi
+    else
+        log_warn "Git pull 실패. 현재 버전으로 계속 진행합니다."
+        log_warn "오류 내용: $(cat /tmp/git-pull-output.log)"
+    fi
+else
+    log_warn "Git 저장소가 아닙니다. 업데이트 확인을 건너뜁니다."
+fi
+
+echo ""
 
 # 1. Docker Compose 이미지 업데이트
 log_info "Step 1: Docker Compose 이미지 업데이트 시작"
@@ -70,8 +171,14 @@ if [ -f "$COMPOSE_LIST" ]; then
         if docker-compose pull; then
             log_info "컨테이너 재시작 중..."
             if docker-compose down && docker-compose up -d; then
-                log_info "업데이트 완료: $compose_path"
-                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+                # 컨테이너 초기화 대기
+                if wait_for_healthy "$compose_path"; then
+                    log_info "업데이트 완료: $compose_path"
+                    SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+                else
+                    log_warn "컨테이너가 완전히 초기화되지 않았지만 계속 진행합니다: $compose_path"
+                    SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+                fi
             else
                 log_error "컨테이너 재시작 실패: $compose_path"
                 FAIL_COUNT=$((FAIL_COUNT + 1))
