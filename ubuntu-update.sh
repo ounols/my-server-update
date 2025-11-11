@@ -42,18 +42,18 @@ wait_for_healthy() {
         local status_info=""
 
         for container in $containers; do
-            local health=$(docker inspect --format='{{.State.Health.Status}}' "$container" 2>/dev/null || echo "none")
-            local status=$(docker inspect --format='{{.State.Status}}' "$container" 2>/dev/null || echo "unknown")
-            local name=$(docker inspect --format='{{.Name}}' "$container" 2>/dev/null | sed 's/\///')
+            local health=$(docker inspect --format='{{.State.Health.Status}}' "$container" 2>/dev/null | tr -d '\n\r' || echo "none")
+            local status=$(docker inspect --format='{{.State.Status}}' "$container" 2>/dev/null | tr -d '\n\r' || echo "unknown")
+            local name=$(docker inspect --format='{{.Name}}' "$container" 2>/dev/null | sed 's/\///' | tr -d '\n\r')
 
-            # health check가 정의되지 않은 경우
-            if [ "$health" = "none" ] || [ "$health" = "<no value>" ]; then
-                if [ "$status" != "running" ]; then
+            # health check가 정의되지 않은 경우 (패턴 매칭 사용)
+            if [[ "$health" == *"none"* ]] || [[ "$health" == *"no value"* ]] || [ -z "$health" ]; then
+                if [[ "$status" != *"running"* ]]; then
                     all_healthy=false
                     status_info="${status_info}\n  - $name: $status (not running)"
                 else
                     # 컨테이너 시작 시간 확인
-                    local started_at=$(docker inspect --format='{{.State.StartedAt}}' "$container" 2>/dev/null)
+                    local started_at=$(docker inspect --format='{{.State.StartedAt}}' "$container" 2>/dev/null | tr -d '\n\r')
                     local started_epoch=$(date -d "$started_at" +%s 2>/dev/null || echo "0")
                     local current_epoch=$(date +%s)
                     local uptime=$((current_epoch - started_epoch))
@@ -67,7 +67,7 @@ wait_for_healthy() {
                 fi
             else
                 # health check가 있는 경우
-                if [ "$health" != "healthy" ]; then
+                if [[ "$health" != *"healthy"* ]]; then
                     all_healthy=false
                     status_info="${status_info}\n  - $name: $health"
                 else
@@ -82,7 +82,8 @@ wait_for_healthy() {
             return 0
         fi
 
-        echo -ne "\r대기 중... ${elapsed}/${max_wait}초 경과"
+        echo -ne "\r대기 중... ${elapsed}/${max_wait}초 경과\n"
+        echo -ne "$status_info"
         sleep $interval
         elapsed=$((elapsed + interval))
     done
