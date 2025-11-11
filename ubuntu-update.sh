@@ -23,6 +23,7 @@ log_error() {
 wait_for_healthy() {
     local compose_path=$1
     local max_wait=${2:-300}  # 기본 최대 대기 시간: 5분
+    local min_uptime=${3:-15}  # health check 없는 컨테이너의 최소 실행 시간: 15초
     local interval=5
     local elapsed=0
 
@@ -47,12 +48,22 @@ wait_for_healthy() {
 
             # health check가 정의되지 않은 경우
             if [ "$health" = "none" ] || [ "$health" = "<no value>" ]; then
-                # running 상태면 OK
                 if [ "$status" != "running" ]; then
                     all_healthy=false
                     status_info="${status_info}\n  - $name: $status (not running)"
                 else
-                    status_info="${status_info}\n  - $name: running (no healthcheck)"
+                    # 컨테이너 시작 시간 확인
+                    local started_at=$(docker inspect --format='{{.State.StartedAt}}' "$container" 2>/dev/null)
+                    local started_epoch=$(date -d "$started_at" +%s 2>/dev/null || echo "0")
+                    local current_epoch=$(date +%s)
+                    local uptime=$((current_epoch - started_epoch))
+
+                    if [ $uptime -lt $min_uptime ]; then
+                        all_healthy=false
+                        status_info="${status_info}\n  - $name: running (uptime: ${uptime}s, waiting for ${min_uptime}s)"
+                    else
+                        status_info="${status_info}\n  - $name: running (uptime: ${uptime}s, no healthcheck)"
+                    fi
                 fi
             else
                 # health check가 있는 경우
