@@ -22,15 +22,21 @@ log_error() {
 # Docker 컨테이너 헬스체크 대기 함수
 wait_for_healthy() {
     local compose_path=$1
-    local max_wait=${2:-300}  # 기본 최대 대기 시간: 5분
-    local min_uptime=${3:-15}  # health check 없는 컨테이너의 최소 실행 시간: 15초
+    local log_file=${2:-}
+    local max_wait=${3:-300}  # 기본 최대 대기 시간: 5분
+    local min_uptime=${4:-15}  # health check 없는 컨테이너의 최소 실행 시간: 15초
     local interval=5
     local elapsed=0
 
     log_info "컨테이너 초기화 대기 중..."
 
-    # 컨테이너 목록 가져오기
-    local containers=$(docker compose -f "$compose_path" ps -q)
+    # 컨테이너 목록 가져오기 (로그가 지정되면 stderr를 로그에 기록)
+    local containers
+    if [ -n "$log_file" ]; then
+        containers=$(docker compose -f "$compose_path" ps -q 2>>"$log_file")
+    else
+        containers=$(docker compose -f "$compose_path" ps -q 2>/dev/null)
+    fi
 
     if [ -z "$containers" ]; then
         log_warn "실행 중인 컨테이너가 없습니다."
@@ -42,9 +48,18 @@ wait_for_healthy() {
         local status_info=""
 
         for container in $containers; do
-            local health=$(docker inspect --format='{{.State.Health.Status}}' "$container" 2>/dev/null | tr -d '\n\r' || echo "none")
-            local status=$(docker inspect --format='{{.State.Status}}' "$container" 2>/dev/null | tr -d '\n\r' || echo "unknown")
-            local name=$(docker inspect --format='{{.Name}}' "$container" 2>/dev/null | sed 's/\///' | tr -d '\n\r')
+            local health
+            local status
+            local name
+            if [ -n "$log_file" ]; then
+                health=$(docker inspect --format='{{.State.Health.Status}}' "$container" 2>>"$log_file" | tr -d '\n\r' || echo "none")
+                status=$(docker inspect --format='{{.State.Status}}' "$container" 2>>"$log_file" | tr -d '\n\r' || echo "unknown")
+                name=$(docker inspect --format='{{.Name}}' "$container" 2>>"$log_file" | sed 's/\///' | tr -d '\n\r')
+            else
+                health=$(docker inspect --format='{{.State.Health.Status}}' "$container" 2>/dev/null | tr -d '\n\r' || echo "none")
+                status=$(docker inspect --format='{{.State.Status}}' "$container" 2>/dev/null | tr -d '\n\r' || echo "unknown")
+                name=$(docker inspect --format='{{.Name}}' "$container" 2>/dev/null | sed 's/\///' | tr -d '\n\r')
+            fi
 
             # health check가 정의되지 않은 경우 (패턴 매칭 사용)
             if [[ "$health" == *"none"* ]] || [[ "$health" == *"no value"* ]] || [ -z "$health" ]; then
@@ -53,7 +68,12 @@ wait_for_healthy() {
                     status_info="${status_info}\n  - $name: $status (not running)"
                 else
                     # 컨테이너 시작 시간 확인
-                    local started_at=$(docker inspect --format='{{.State.StartedAt}}' "$container" 2>/dev/null | tr -d '\n\r')
+                    local started_at
+                    if [ -n "$log_file" ]; then
+                        started_at=$(docker inspect --format='{{.State.StartedAt}}' "$container" 2>>"$log_file" | tr -d '\n\r')
+                    else
+                        started_at=$(docker inspect --format='{{.State.StartedAt}}' "$container" 2>/dev/null | tr -d '\n\r')
+                    fi
                     local started_epoch=$(date -d "$started_at" +%s 2>/dev/null || echo "0")
                     local current_epoch=$(date +%s)
                     local uptime=$((current_epoch - started_epoch))
@@ -96,11 +116,20 @@ wait_for_healthy() {
 # 스크립트 실행 디렉토리
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# 로그 디렉토리 (스크립트가 있는 곳 기준)
+LOG_DIR="$SCRIPT_DIR/log"
+# NOTE: LOG_DIR will be created after root permission check to avoid ownership issues.
+
 # 루트 권한 확인
 if [ "$EUID" -ne 0 ]; then
     log_error "이 스크립트는 root 권한이 필요합니다. sudo를 사용해주세요."
     exit 1
 fi
+
+# 로그 디렉토리 생성 (루트 권한 보장된 이후)
+mkdir -p "$LOG_DIR" 2>/dev/null || {
+    log_warn "로그 디렉토리 생성 실패: $LOG_DIR"
+}
 
 
 log_info "=== 시스템 업데이트 스크립트 시작 ==="
@@ -117,11 +146,17 @@ if [ -d "$SCRIPT_DIR/.git" ]; then
         exit 1
     }
 
-    # 현재 커밋 해시 저장
+    # 현재 브랜치 감지 및 커밋 해시 저장
+    CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
     CURRENT_COMMIT=$(git rev-parse HEAD 2>/dev/null)
 
-    # git pull 실행
-    if git pull origin main 2>&1 | tee /tmp/git-pull-output.log; then
+    if [ -z "$CURRENT_BRANCH" ]; then
+        CURRENT_BRANCH="main"
+        log_warn "현재 브랜치를 감지할 수 없어 'main' 브랜치로 pull을 시도합니다."
+    fi
+
+    # git pull 실행 (로그는 append)
+    if git pull origin "$CURRENT_BRANCH" 2>&1 | tee -a "$LOG_DIR/git-pull-output.log"; then
         # pull 후 커밋 해시 확인
         NEW_COMMIT=$(git rev-parse HEAD 2>/dev/null)
 
@@ -130,14 +165,14 @@ if [ -d "$SCRIPT_DIR/.git" ]; then
             log_info "새 버전으로 재실행합니다..."
             echo ""
 
-            # 스크립트 재실행 (모든 인자 전달)
-            exec "$0" "$@"
+            # 스크립트 재실행: bash로 스크립트 경로를 명확히 지정
+            exec "$BASH" "$SCRIPT_DIR/$(basename "$0")" "$@"
         else
             log_info "이미 최신 버전입니다."
         fi
     else
         log_warn "Git pull 실패. 현재 버전으로 계속 진행합니다."
-        log_warn "오류 내용: $(cat /tmp/git-pull-output.log)"
+        log_warn "오류 내용: $(cat "$LOG_DIR/git-pull-output.log" 2>/dev/null || echo '로그 없음')"
     fi
 else
     log_warn "Git 저장소가 아닙니다. 업데이트 확인을 건너뜁니다."
@@ -159,6 +194,10 @@ if [ -f "$COMPOSE_LIST" ]; then
     TOTAL_COUNT=0
 
     while IFS= read -r compose_path || [ -n "$compose_path" ]; do
+        # CR 제거 및 양끝 공백 제거
+        compose_path="${compose_path%$'\r'}"
+        compose_path="$(echo "$compose_path" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
         # 빈 줄이나 주석(#으로 시작) 건너뛰기
         [[ -z "$compose_path" || "$compose_path" =~ ^[[:space:]]*# ]] && continue
 
@@ -179,12 +218,31 @@ if [ -f "$COMPOSE_LIST" ]; then
             continue
         }
 
+        # per-compose 로그 파일
+        COMPOSE_LOG="$LOG_DIR/docker-$TOTAL_COUNT.log"
+        echo "===== $compose_path - $(date '+%Y-%m-%d %H:%M:%S') =====" >> "$COMPOSE_LOG" 2>/dev/null || true
+
+        # 해당 디렉토리에 Git 저장소가 있으면 현재 브랜치로 pull 시도
+        if [ -d "$COMPOSE_DIR/.git" ]; then
+            branch=$(git -C "$COMPOSE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+            if [ -n "$branch" ]; then
+                log_info "Git 저장소 발견 (브랜치: $branch). 최신 커밋을 가져옵니다..."
+                if git -C "$COMPOSE_DIR" pull origin "$branch" 2>&1 | tee "$LOG_DIR/git-pull-$TOTAL_COUNT.log"; then
+                    log_info "Git pull 성공: $COMPOSE_DIR (브랜치: $branch)"
+                else
+                    log_warn "Git pull 실패 또는 충돌 필요: $COMPOSE_DIR (브랜치: $branch). 계속 진행합니다. ($LOG_DIR/git-pull-$TOTAL_COUNT.log 참고)"
+                fi
+            else
+                log_warn "현재 브랜치 정보를 얻을 수 없어 git pull을 건너뜁니다: $COMPOSE_DIR"
+            fi
+        fi
+
         log_info "최신 이미지 다운로드 중..."
-        if docker compose pull; then
+        if docker compose pull 2>&1 | tee -a "$COMPOSE_LOG"; then
             log_info "컨테이너 재시작 중..."
-            if docker compose down && docker compose up -d; then
+            if (docker compose down 2>&1 | tee -a "$COMPOSE_LOG") && (docker compose up -d 2>&1 | tee -a "$COMPOSE_LOG"); then
                 # 컨테이너 초기화 대기
-                if wait_for_healthy "$compose_path"; then
+                if wait_for_healthy "$compose_path" "$COMPOSE_LOG"; then
                     log_info "업데이트 완료: $compose_path"
                     SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
                 else
@@ -215,8 +273,11 @@ fi
 
 # 2. 사용하지 않는 Docker 이미지 제거
 log_info "Step 2: 사용하지 않는 Docker 이미지 제거"
-docker image prune -af
-log_info "Docker 이미지 정리 완료"
+if docker image prune -af 2>&1 | tee -a "$LOG_DIR/docker-prune.log"; then
+    log_info "Docker 이미지 정리 완료"
+else
+    log_warn "Docker 이미지 정리 중 오류가 발생했습니다. 상세 로그: $LOG_DIR/docker-prune.log"
+fi
 
 # 3. APT 업데이트
 log_info "Step 3: APT 패키지 목록 업데이트"
