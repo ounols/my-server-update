@@ -131,6 +131,12 @@ mkdir -p "$LOG_DIR" 2>/dev/null || {
     log_warn "로그 디렉토리 생성 실패: $LOG_DIR"
 }
 
+# 실행 단위 통합 로그 파일 (한 번 실행 시 모든 로그를 이 파일에 기록)
+RUN_LOG="$LOG_DIR/run-$(date '+%Y%m%d-%H%M%S').log"
+# 빈 파일로 초기화
+: > "$RUN_LOG" 2>/dev/null || true
+log_info "실행 로그: $RUN_LOG"
+
 
 log_info "=== 시스템 업데이트 스크립트 시작 ==="
 log_info "작업 디렉토리: $SCRIPT_DIR"
@@ -155,8 +161,8 @@ if [ -d "$SCRIPT_DIR/.git" ]; then
         log_warn "현재 브랜치를 감지할 수 없어 'main' 브랜치로 pull을 시도합니다."
     fi
 
-    # git pull 실행 (로그는 append)
-    if git pull origin "$CURRENT_BRANCH" 2>&1 | tee -a "$LOG_DIR/git-pull-output.log"; then
+    # git pull 실행 (로그는 실행 로그에 append)
+    if git pull origin "$CURRENT_BRANCH" 2>&1 | tee -a "$RUN_LOG"; then
         # pull 후 커밋 해시 확인
         NEW_COMMIT=$(git rev-parse HEAD 2>/dev/null)
 
@@ -172,7 +178,7 @@ if [ -d "$SCRIPT_DIR/.git" ]; then
         fi
     else
         log_warn "Git pull 실패. 현재 버전으로 계속 진행합니다."
-        log_warn "오류 내용: $(cat "$LOG_DIR/git-pull-output.log" 2>/dev/null || echo '로그 없음')"
+        log_warn "오류 내용: $(tail -n 100 "$RUN_LOG" 2>/dev/null || echo '로그 없음')"
     fi
 else
     log_warn "Git 저장소가 아닙니다. 업데이트 확인을 건너뜁니다."
@@ -218,19 +224,18 @@ if [ -f "$COMPOSE_LIST" ]; then
             continue
         }
 
-        # per-compose 로그 파일
-        COMPOSE_LOG="$LOG_DIR/docker-$TOTAL_COUNT.log"
-        echo "===== $compose_path - $(date '+%Y-%m-%d %H:%M:%S') =====" >> "$COMPOSE_LOG" 2>/dev/null || true
+        # 실행 통합 로그에 섹션 헤더 추가
+        echo "===== $compose_path - $(date '+%Y-%m-%d %H:%M:%S') =====" >> "$RUN_LOG" 2>/dev/null || true
 
         # 해당 디렉토리에 Git 저장소가 있으면 현재 브랜치로 pull 시도
         if [ -d "$COMPOSE_DIR/.git" ]; then
             branch=$(git -C "$COMPOSE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
             if [ -n "$branch" ]; then
                 log_info "Git 저장소 발견 (브랜치: $branch). 최신 커밋을 가져옵니다..."
-                if git -C "$COMPOSE_DIR" pull origin "$branch" 2>&1 | tee "$LOG_DIR/git-pull-$TOTAL_COUNT.log"; then
+                if git -C "$COMPOSE_DIR" pull origin "$branch" 2>&1 | tee -a "$RUN_LOG"; then
                     log_info "Git pull 성공: $COMPOSE_DIR (브랜치: $branch)"
                 else
-                    log_warn "Git pull 실패 또는 충돌 필요: $COMPOSE_DIR (브랜치: $branch). 계속 진행합니다. ($LOG_DIR/git-pull-$TOTAL_COUNT.log 참고)"
+                    log_warn "Git pull 실패 또는 충돌 필요: $COMPOSE_DIR (브랜치: $branch). 계속 진행합니다. (상세: $RUN_LOG)"
                 fi
             else
                 log_warn "현재 브랜치 정보를 얻을 수 없어 git pull을 건너뜁니다: $COMPOSE_DIR"
@@ -238,11 +243,11 @@ if [ -f "$COMPOSE_LIST" ]; then
         fi
 
         log_info "최신 이미지 다운로드 중..."
-        if docker compose pull 2>&1 | tee -a "$COMPOSE_LOG"; then
+        if docker compose pull 2>&1 | tee -a "$RUN_LOG"; then
             log_info "컨테이너 재시작 중..."
-            if (docker compose down 2>&1 | tee -a "$COMPOSE_LOG") && (docker compose up -d 2>&1 | tee -a "$COMPOSE_LOG"); then
+            if (docker compose down 2>&1 | tee -a "$RUN_LOG") && (docker compose up -d 2>&1 | tee -a "$RUN_LOG"); then
                 # 컨테이너 초기화 대기
-                if wait_for_healthy "$compose_path" "$COMPOSE_LOG"; then
+                if wait_for_healthy "$compose_path" "$RUN_LOG"; then
                     log_info "업데이트 완료: $compose_path"
                     SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
                 else
@@ -273,10 +278,10 @@ fi
 
 # 2. 사용하지 않는 Docker 이미지 제거
 log_info "Step 2: 사용하지 않는 Docker 이미지 제거"
-if docker image prune -af 2>&1 | tee -a "$LOG_DIR/docker-prune.log"; then
+if docker image prune -af 2>&1 | tee -a "$RUN_LOG"; then
     log_info "Docker 이미지 정리 완료"
 else
-    log_warn "Docker 이미지 정리 중 오류가 발생했습니다. 상세 로그: $LOG_DIR/docker-prune.log"
+    log_warn "Docker 이미지 정리 중 오류가 발생했습니다. 상세 로그: $RUN_LOG"
 fi
 
 # 3. APT 업데이트
