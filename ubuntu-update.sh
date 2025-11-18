@@ -30,7 +30,7 @@ wait_for_healthy() {
     log_info "컨테이너 초기화 대기 중..."
 
     # 컨테이너 목록 가져오기
-    local containers=$(docker-compose -f "$compose_path" ps -q)
+    local containers=$(docker compose -f "$compose_path" ps -q)
 
     if [ -z "$containers" ]; then
         log_warn "실행 중인 컨테이너가 없습니다."
@@ -180,9 +180,9 @@ if [ -f "$COMPOSE_LIST" ]; then
         }
 
         log_info "최신 이미지 다운로드 중..."
-        if docker-compose pull; then
+        if docker compose pull; then
             log_info "컨테이너 재시작 중..."
-            if docker-compose down && docker-compose up -d; then
+            if docker compose down && docker compose up -d; then
                 # 컨테이너 초기화 대기
                 if wait_for_healthy "$compose_path"; then
                     log_info "업데이트 완료: $compose_path"
