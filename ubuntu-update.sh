@@ -242,6 +242,18 @@ if [ -f "$COMPOSE_LIST" ]; then
             fi
         fi
 
+        # Dockerfile 빌드 서비스 감지 및 재빌드
+        if grep -qE '^\s+build:' "$compose_path" 2>/dev/null; then
+            log_info "Dockerfile 빌드 서비스 감지됨. 재빌드를 진행합니다..."
+            if docker compose build --pull 2>&1 | tee -a "$RUN_LOG"; then
+                log_info "재빌드 완료: $compose_path"
+            else
+                log_error "빌드 실패: $compose_path"
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                continue
+            fi
+        fi
+
         log_info "최신 이미지 다운로드 중..."
         if docker compose pull 2>&1 | tee -a "$RUN_LOG"; then
             log_info "컨테이너 재시작 중..."
@@ -276,12 +288,17 @@ else
     log_warn "compose-list.txt 파일을 찾을 수 없습니다. Docker 업데이트를 건너뜁니다."
 fi
 
-# 2. 사용하지 않는 Docker 이미지 제거
-log_info "Step 2: 사용하지 않는 Docker 이미지 제거"
+# 2. 사용하지 않는 Docker 이미지 및 빌드 캐시 제거
+log_info "Step 2: 사용하지 않는 Docker 이미지 및 빌드 캐시 제거"
 if docker image prune -af 2>&1 | tee -a "$RUN_LOG"; then
     log_info "Docker 이미지 정리 완료"
 else
     log_warn "Docker 이미지 정리 중 오류가 발생했습니다. 상세 로그: $RUN_LOG"
+fi
+if docker builder prune -af 2>&1 | tee -a "$RUN_LOG"; then
+    log_info "Docker 빌드 캐시 정리 완료"
+else
+    log_warn "Docker 빌드 캐시 정리 중 오류가 발생했습니다. 상세 로그: $RUN_LOG"
 fi
 
 # 3. APT 업데이트
