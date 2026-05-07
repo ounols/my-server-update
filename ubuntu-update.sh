@@ -243,9 +243,35 @@ if [ -f "$COMPOSE_LIST" ]; then
         fi
 
         # Dockerfile 빌드 서비스 감지 및 재빌드
-        if grep -qE '^\s+build:' "$compose_path" 2>/dev/null; then
-            log_info "Dockerfile 빌드 서비스 감지됨. 재빌드를 진행합니다..."
-            if docker compose build --pull 2>&1 | tee -a "$RUN_LOG"; then
+        # image: 없이 build:만 있는 서비스가 하나라도 있을 때만 빌드 실행
+        # (image: + build: 둘 다 있으면 registry에서 pull 가능하므로 빌드 불필요)
+        BUILD_NEEDED=false
+        if docker compose -f "$compose_path" config > /dev/null 2>&1; then
+            BUILD_NEEDED=$(docker compose -f "$compose_path" config 2>/dev/null | awk '
+            BEGIN { in_services=0; has_build=0; has_image=0; needs_build=0 }
+            /^services:/ { in_services=1; next }
+            !in_services { next }
+            /^[a-zA-Z]/ { in_services=0; next }
+            /^  [a-zA-Z_-]/ {
+                if (has_build && !has_image) needs_build=1
+                has_build=0; has_image=0
+            }
+            /^    build:/ { has_build=1 }
+            /^    image:/ { has_image=1 }
+            END {
+                if (has_build && !has_image) needs_build=1
+                print (needs_build ? "true" : "false")
+            }')
+        else
+            # docker compose config 실패 시 기존 방식으로 fallback
+            if grep -qE '^\s+build:' "$compose_path" 2>/dev/null; then
+                BUILD_NEEDED=true
+            fi
+        fi
+
+        if [ "$BUILD_NEEDED" = "true" ]; then
+            log_info "빌드 전용 서비스 감지됨 (image 없이 build만 존재). 재빌드를 진행합니다..."
+            if docker compose -f "$compose_path" build --pull 2>&1 | tee -a "$RUN_LOG"; then
                 log_info "재빌드 완료: $compose_path"
             else
                 log_error "빌드 실패: $compose_path"
