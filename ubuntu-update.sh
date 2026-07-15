@@ -102,8 +102,8 @@ wait_for_healthy() {
             return 0
         fi
 
-        echo -ne "\r대기 중... ${elapsed}/${max_wait}초 경과\n"
-        echo -ne "$status_info"
+        echo "대기 중... ${elapsed}/${max_wait}초 경과"
+        echo -e "$status_info"
         sleep $interval
         elapsed=$((elapsed + interval))
     done
@@ -132,9 +132,44 @@ mkdir -p "$LOG_DIR" 2>/dev/null || {
 }
 
 # 실행 단위 통합 로그 파일 (한 번 실행 시 모든 로그를 이 파일에 기록)
-RUN_LOG="$LOG_DIR/run-$(date '+%Y%m%d-%H%M%S').log"
-# 빈 파일로 초기화
-: > "$RUN_LOG" 2>/dev/null || true
+# 분리 실행된 워커는 부모가 지정한 로그 파일을 그대로 사용 (자체 업데이트 재실행 시에도 유지)
+if [ -n "${UPDATE_RUN_LOG:-}" ]; then
+    RUN_LOG="$UPDATE_RUN_LOG"
+else
+    RUN_LOG="$LOG_DIR/run-$(date '+%Y%m%d-%H%M%S').log"
+    : > "$RUN_LOG" 2>/dev/null || {
+        log_error "로그 파일 생성 실패: $RUN_LOG"
+        exit 1
+    }
+fi
+
+# 터미널(SSH 포함)에서 실행된 경우 별도 세션으로 분리 실행.
+# SSH 연결이 끊겨도(예: apt가 tailscale을 업그레이드하며 tailscaled 재시작)
+# 워커는 SIGHUP을 받지 않고 끝까지 실행되며, 현재 터미널에는 로그를 실시간 표시한다.
+if [ -z "${UPDATE_DETACHED:-}" ] && [ -t 1 ] && command -v setsid >/dev/null 2>&1; then
+    log_info "실행 로그: $RUN_LOG"
+    log_info "연결이 끊겨도 작업이 계속되도록 분리 실행합니다."
+
+    UPDATE_DETACHED=1 UPDATE_RUN_LOG="$RUN_LOG" \
+        setsid "$BASH" "$SCRIPT_DIR/$(basename "$0")" "$@" >> "$RUN_LOG" 2>&1 < /dev/null &
+    WORKER_PID=$!
+
+    log_info "작업 PID: $WORKER_PID — 연결이 끊기면 재접속 후 확인: tail -f $RUN_LOG"
+    echo ""
+
+    # 워커가 끝날 때까지 로그를 실시간 표시. 이 tail(현재 세션)이 끊겨도 워커는 계속된다.
+    tail --pid="$WORKER_PID" -n +1 -f "$RUN_LOG"
+    wait "$WORKER_PID"
+    exit $?
+fi
+
+# 여기서부터는 실제 작업 프로세스. 터미널 없이 직접 실행된 경우(cron 등)도
+# 모든 출력이 로그 파일에 남도록 리다이렉트한다. (분리 실행된 워커는 부모가 이미 처리,
+# setsid가 없어 터미널에서 직접 실행 중이면 화면 출력을 유지)
+if [ -z "${UPDATE_DETACHED:-}" ] && [ ! -t 1 ]; then
+    exec >> "$RUN_LOG" 2>&1
+fi
+
 log_info "실행 로그: $RUN_LOG"
 
 
@@ -161,8 +196,7 @@ if [ -d "$SCRIPT_DIR/.git" ]; then
         log_warn "현재 브랜치를 감지할 수 없어 'main' 브랜치로 pull을 시도합니다."
     fi
 
-    # git pull 실행 (로그는 실행 로그에 append)
-    if git pull origin "$CURRENT_BRANCH" 2>&1 | tee -a "$RUN_LOG"; then
+    if git pull origin "$CURRENT_BRANCH"; then
         # pull 후 커밋 해시 확인
         NEW_COMMIT=$(git rev-parse HEAD 2>/dev/null)
 
@@ -178,7 +212,6 @@ if [ -d "$SCRIPT_DIR/.git" ]; then
         fi
     else
         log_warn "Git pull 실패. 현재 버전으로 계속 진행합니다."
-        log_warn "오류 내용: $(tail -n 100 "$RUN_LOG" 2>/dev/null || echo '로그 없음')"
     fi
 else
     log_warn "Git 저장소가 아닙니다. 업데이트 확인을 건너뜁니다."
@@ -232,7 +265,7 @@ if [ -f "$COMPOSE_LIST" ]; then
             branch=$(git -C "$COMPOSE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
             if [ -n "$branch" ]; then
                 log_info "Git 저장소 발견 (브랜치: $branch). 최신 커밋을 가져옵니다..."
-                if git -C "$COMPOSE_DIR" pull origin "$branch" 2>&1 | tee -a "$RUN_LOG"; then
+                if git -C "$COMPOSE_DIR" pull origin "$branch"; then
                     log_info "Git pull 성공: $COMPOSE_DIR (브랜치: $branch)"
                 else
                     log_warn "Git pull 실패 또는 충돌 필요: $COMPOSE_DIR (브랜치: $branch). 계속 진행합니다. (상세: $RUN_LOG)"
@@ -271,7 +304,7 @@ if [ -f "$COMPOSE_LIST" ]; then
 
         if [ "$BUILD_NEEDED" = "true" ]; then
             log_info "빌드 전용 서비스 감지됨 (image 없이 build만 존재). 재빌드를 진행합니다..."
-            if docker compose -f "$compose_path" build --pull 2>&1 | tee -a "$RUN_LOG"; then
+            if docker compose -f "$compose_path" build --pull; then
                 log_info "재빌드 완료: $compose_path"
             else
                 log_error "빌드 실패: $compose_path"
@@ -281,9 +314,9 @@ if [ -f "$COMPOSE_LIST" ]; then
         fi
 
         log_info "최신 이미지 다운로드 중..."
-        if docker compose pull 2>&1 | tee -a "$RUN_LOG"; then
+        if docker compose pull; then
             log_info "컨테이너 재시작 중..."
-            if (docker compose down 2>&1 | tee -a "$RUN_LOG") && (docker compose up -d 2>&1 | tee -a "$RUN_LOG"); then
+            if docker compose down && docker compose up -d; then
                 # 컨테이너 초기화 대기
                 if wait_for_healthy "$compose_path" "$RUN_LOG"; then
                     log_info "업데이트 완료: $compose_path"
@@ -316,12 +349,12 @@ fi
 
 # 2. 사용하지 않는 Docker 이미지 및 빌드 캐시 제거
 log_info "Step 2: 사용하지 않는 Docker 이미지 및 빌드 캐시 제거"
-if docker image prune -af 2>&1 | tee -a "$RUN_LOG"; then
+if docker image prune -af; then
     log_info "Docker 이미지 정리 완료"
 else
     log_warn "Docker 이미지 정리 중 오류가 발생했습니다. 상세 로그: $RUN_LOG"
 fi
-if docker builder prune -af 2>&1 | tee -a "$RUN_LOG"; then
+if docker builder prune -af; then
     log_info "Docker 빌드 캐시 정리 완료"
 else
     log_warn "Docker 빌드 캐시 정리 중 오류가 발생했습니다. 상세 로그: $RUN_LOG"
@@ -355,13 +388,13 @@ log_info "시스템 정리 완료"
 log_info "Step 6: 재부팅 필요 여부 확인"
 if [ -f /var/run/reboot-required ]; then
     log_warn "시스템 재부팅이 필요합니다."
-    log_info "10초 후 자동으로 재부팅됩니다..."
+    # 분리 실행 중에는 터미널의 Ctrl+C가 워커에 전달되지 않으므로 kill로 취소해야 한다.
+    log_info "10초 후 자동으로 재부팅됩니다... (취소하려면: sudo kill $$)"
 
     for i in {10..1}; do
-        echo -ne "\r재부팅까지 ${i}초 남음... (Ctrl+C로 취소 가능)"
+        echo "재부팅까지 ${i}초 남음..."
         sleep 1
     done
-    echo ""
 
     log_info "시스템 재부팅 중..."
     reboot
