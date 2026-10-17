@@ -113,6 +113,144 @@ wait_for_healthy() {
     return 1
 }
 
+# dpkg/apt 자동 복구에 사용하는 공통 옵션
+# DPkg::Lock::Timeout: 다른 패키지 관리 프로세스가 락을 잡고 있으면 최대 5분 대기
+APT_LOCK_OPTS=(-o DPkg::Lock::Timeout=300)
+# 복구 중에는 설정 파일 충돌 시 기존 설정을 유지 (비대화형 환경에서 멈추지 않도록)
+APT_FIX_OPTS=("${APT_LOCK_OPTS[@]}" -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+
+# 다른 패키지 관리 프로세스(unattended-upgrades 등)가 dpkg 락을 잡고 있으면 끝날 때까지 대기
+# (작업 중인 패키지는 일시적으로 미설정 상태로 보이므로, 끝나기 전에 점검하면 오탐이 생긴다)
+wait_for_dpkg_lock() {
+    local max_wait=${1:-300}
+    local interval=5
+    local elapsed=0
+    local locks=(/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock)
+
+    # fuser가 없으면 확인을 건너뜀 (apt 쪽은 DPkg::Lock::Timeout이 처리)
+    command -v fuser >/dev/null 2>&1 || return 0
+
+    while fuser "${locks[@]}" >/dev/null 2>&1; do
+        if [ $elapsed -ge $max_wait ]; then
+            return 1
+        fi
+        if [ $elapsed -eq 0 ]; then
+            log_info "다른 패키지 관리 작업이 진행 중입니다. 끝날 때까지 대기합니다..."
+        fi
+        sleep $interval
+        elapsed=$((elapsed + interval))
+    done
+    return 0
+}
+
+# dpkg/apt 상태가 정상인지 확인 (정상이면 0)
+dpkg_is_healthy() {
+    [ -z "$(dpkg --audit 2>/dev/null)" ] && apt-get check >/dev/null 2>&1
+}
+
+# 실행 중인 커널보다 낮은 버전의 커널 헤더 패키지인지 확인 (강제 제거해도 안전한 대상)
+# 이미지/모듈 패키지, 메타 패키지, 실행 중이거나 더 새로운 커널의 헤더는 해당하지 않는다.
+is_stale_kernel_headers() {
+    local pkg=$1
+    local running_ver ver
+
+    # 예: 6.17.0-1019-oracle -> 6.17.0-1019
+    running_ver="$(uname -r)"
+    running_ver="${running_ver%-*}"
+
+    [[ "$pkg" =~ ^linux-(.+-)?headers-[0-9] ]] || return 1
+    [[ "$pkg" =~ ([0-9]+\.[0-9]+\.[0-9]+-[0-9]+) ]] || return 1
+    ver="${BASH_REMATCH[1]}"
+
+    dpkg --compare-versions "$ver" lt "$running_ver"
+}
+
+# 복구 전 dpkg 상태 파일 백업 (최근 5개만 유지)
+backup_dpkg_status() {
+    local backup="$LOG_DIR/dpkg-status-$(date '+%Y%m%d-%H%M%S').bak"
+
+    if cp -p /var/lib/dpkg/status "$backup" 2>/dev/null; then
+        log_info "dpkg 상태 백업: $backup"
+        ls -1t "$LOG_DIR"/dpkg-status-*.bak 2>/dev/null | tail -n +6 | xargs -r rm -f --
+    else
+        log_warn "dpkg 상태 백업에 실패했습니다. 계속 진행합니다."
+    fi
+}
+
+# apt-get install -f 실행. 패키지를 제거해야 하는 경우에는 자동 진행하지 않는다.
+apt_fix_broken() {
+    local removals
+    removals=$(apt-get -s -f install 2>/dev/null | grep '^Remv' || true)
+
+    if [ -n "$removals" ]; then
+        log_error "apt-get install -f 가 아래 패키지를 제거하려고 하여 자동으로 진행하지 않습니다:"
+        echo "$removals"
+        return 1
+    fi
+
+    DEBIAN_FRONTEND=noninteractive apt-get install -f -y "${APT_FIX_OPTS[@]}"
+}
+
+# dpkg/apt 상태 점검 및 자동 복구. 정상이면 아무것도 하지 않고 0을 반환한다.
+# 복구 후에도 문제가 남으면 1을 반환한다.
+#   1) dpkg --configure -a   : 중단된 패키지 설정 재개
+#   2) apt-get install -f    : 깨진 의존성 수정
+#   3) reinstreq 패키지 처리 : 재설치, 실패하면 오래된 커널 헤더에 한해 강제 제거
+repair_dpkg() {
+    wait_for_dpkg_lock || log_warn "dpkg 락 대기 시간을 초과했습니다. 그대로 진행합니다."
+
+    if dpkg_is_healthy; then
+        return 0
+    fi
+
+    log_warn "dpkg/apt 상태에 문제가 감지되었습니다. 자동 복구를 시도합니다."
+    dpkg --audit 2>&1
+    backup_dpkg_status
+
+    log_info "복구 1/3: 미설정 패키지 설정 (dpkg --configure -a)"
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a || log_warn "dpkg --configure -a 가 실패했습니다. 다음 단계를 진행합니다."
+    if dpkg_is_healthy; then
+        log_info "dpkg/apt 상태 복구 완료"
+        return 0
+    fi
+
+    log_info "복구 2/3: 깨진 의존성 수정 (apt-get install -f)"
+    apt_fix_broken || log_warn "apt-get install -f 가 완료되지 않았습니다. 다음 단계를 진행합니다."
+    if dpkg_is_healthy; then
+        log_info "dpkg/apt 상태 복구 완료"
+        return 0
+    fi
+
+    log_info "복구 3/3: 재설치가 필요한(reinstreq) 패키지 처리"
+    local pkg
+    for pkg in $(dpkg-query -W -f='${db:Status-Eflag} ${binary:Package}\n' 2>/dev/null | awk '$1 == "reinstreq" {print $2}'); do
+        log_warn "재설치가 필요한 패키지: $pkg"
+        if DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y "${APT_FIX_OPTS[@]}" "$pkg"; then
+            log_info "재설치 완료: $pkg"
+        elif is_stale_kernel_headers "$pkg"; then
+            log_warn "재설치에 실패했습니다. 실행 중인 커널보다 오래된 헤더 패키지이므로 강제 제거합니다: $pkg"
+            dpkg --remove --force-remove-reinstreq "$pkg" || log_error "강제 제거 실패: $pkg"
+        else
+            log_error "자동으로 복구할 수 없는 패키지입니다 (수동 확인 필요): $pkg"
+        fi
+    done
+
+    # 재설치/제거 후 남은 의존성 문제 마무리
+    if ! dpkg_is_healthy; then
+        apt_fix_broken || true
+    fi
+
+    if dpkg_is_healthy; then
+        log_info "dpkg/apt 상태 복구 완료"
+        return 0
+    fi
+
+    log_error "자동 복구 후에도 dpkg/apt 상태에 문제가 남아 있습니다:"
+    dpkg --audit 2>&1
+    apt-get check 2>&1
+    return 1
+}
+
 # 스크립트 실행 디렉토리
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -371,11 +509,30 @@ fi
 
 # 4. APT 업그레이드
 log_info "Step 4: APT 패키지 업그레이드"
-if DEBIAN_FRONTEND=noninteractive apt upgrade -y; then
+
+# 이전 실행 등으로 dpkg 상태가 깨져 있으면 업그레이드 전에 복구
+if ! repair_dpkg; then
+    log_error "dpkg 상태 복구 실패. APT 업그레이드를 중단합니다."
+    exit 1
+fi
+
+if DEBIAN_FRONTEND=noninteractive apt upgrade -y "${APT_LOCK_OPTS[@]}"; then
     log_info "APT 업그레이드 완료"
 else
     log_error "APT 업그레이드 실패"
-    exit 1
+
+    # 업그레이드 도중 패키지 설정이 실패해 dpkg 상태가 깨진 경우에만 복구 후 한 번 재시도
+    if dpkg_is_healthy; then
+        exit 1
+    fi
+
+    log_warn "dpkg 상태가 깨져 있습니다. 복구 후 업그레이드를 한 번 재시도합니다."
+    if repair_dpkg && DEBIAN_FRONTEND=noninteractive apt upgrade -y "${APT_LOCK_OPTS[@]}"; then
+        log_info "APT 업그레이드 완료 (복구 후 재시도)"
+    else
+        log_error "APT 업그레이드 재시도 실패"
+        exit 1
+    fi
 fi
 
 # 5. 불필요한 패키지 제거 및 캐시 정리
