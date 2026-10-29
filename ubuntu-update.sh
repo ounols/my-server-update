@@ -251,6 +251,138 @@ repair_dpkg() {
     return 1
 }
 
+# 패키지 이름에서 커널 버전 추출 (예: linux-image-6.17.0-1020-oracle -> 6.17.0-1020)
+# 버전이 없는 메타 패키지(linux-image-oracle, linux-oracle-6.17-headers 등)는 빈 문자열
+kernel_pkg_version() {
+    [[ "$1" =~ ^linux-.*-([0-9]+\.[0-9]+\.[0-9]+-[0-9]+)(-[a-z0-9]+)?$ ]] && echo "${BASH_REMATCH[1]}"
+}
+
+# 설치된 linux-* 패키지 이름 목록
+installed_linux_pkgs() {
+    dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'linux-*' 2>/dev/null | awk '$1 ~ /^.i/ {print $2}'
+}
+
+# 오래된 커널 패키지 제거
+# 유지 대상: 실행 중인 커널, 그보다 새로운 커널(재부팅 대기), 실행 중인 커널 직전 버전 1개(예비 부팅용)
+purge_old_kernels() {
+    local running_ver pkg ver fallback=""
+    local -a versions=() targets=()
+
+    running_ver="$(uname -r)"
+    running_ver="${running_ver%-*}"
+
+    mapfile -t versions < <(installed_linux_pkgs | while read -r pkg; do kernel_pkg_version "$pkg"; done | sort -uV)
+
+    for ver in "${versions[@]}"; do
+        dpkg --compare-versions "$ver" lt "$running_ver" && fallback="$ver"
+    done
+
+    for pkg in $(installed_linux_pkgs); do
+        ver="$(kernel_pkg_version "$pkg")"
+        [ -n "$ver" ] || continue
+        dpkg --compare-versions "$ver" lt "$running_ver" || continue
+        [ "$ver" = "$fallback" ] && continue
+        targets+=("$pkg")
+    done
+
+    log_info "커널 유지: 실행 중 $running_ver, 예비 ${fallback:-없음}"
+
+    if [ ${#targets[@]} -eq 0 ]; then
+        log_info "제거할 오래된 커널이 없습니다."
+        return 0
+    fi
+
+    # 대상 외의 패키지(메타 패키지 등)까지 함께 제거되는 경우에는 진행하지 않는다
+    local extra
+    extra=$(apt-get -s purge "${targets[@]}" 2>/dev/null | awk '/^(Purg|Remv) /{print $2}' | grep -vxF -f <(printf '%s\n' "${targets[@]}") || true)
+    if [ -n "$extra" ]; then
+        log_warn "오래된 커널 제거 시 아래 패키지도 함께 제거되어 건너뜁니다:"
+        echo "$extra"
+        return 1
+    fi
+
+    log_info "오래된 커널 패키지 제거: ${targets[*]}"
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y "${APT_LOCK_OPTS[@]}" "${targets[@]}"
+}
+
+# 제거 후 설정 파일만 남은(rc) 커널 패키지 정리
+purge_residual_kernel_configs() {
+    local -a residual
+    mapfile -t residual < <(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'linux-*' 2>/dev/null | awk '$1 == "rc" {print $2}')
+
+    if [ ${#residual[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    log_info "설정 파일만 남은 커널 패키지 ${#residual[@]}개 정리"
+    dpkg --purge "${residual[@]}" >/dev/null
+}
+
+# 어떤 패키지에도 속하지 않는 /lib/modules/<버전> 디렉토리 삭제 (실행 중인 커널은 제외)
+remove_orphan_kernel_modules() {
+    local dir name
+
+    for dir in /lib/modules/*/; do
+        dir="${dir%/}"
+        name="$(basename "$dir")"
+        [ "$name" = "$(uname -r)" ] && continue
+        dpkg -S "$dir" >/dev/null 2>&1 && continue
+
+        log_info "패키지 없이 남은 모듈 디렉토리 삭제: $dir"
+        rm -rf -- "$dir"
+    done
+}
+
+# snap의 비활성(disabled) 옛 리비전 제거. hold된 snap은 건너뛴다.
+remove_disabled_snap_revisions() {
+    command -v snap >/dev/null 2>&1 || return 0
+
+    # 앞으로 리비전을 2개까지만 유지
+    snap set system refresh.retain=2 2>/dev/null || true
+
+    local name rev
+    snap list --all 2>/dev/null | awk 'NR > 1 && $NF ~ /disabled/ && $NF !~ /held/ {print $1, $3}' |
+    while read -r name rev; do
+        log_info "snap 옛 리비전 제거: $name (revision $rev)"
+        snap remove "$name" --revision="$rev" || log_warn "snap 리비전 제거 실패: $name ($rev)"
+    done
+}
+
+# systemd 저널 용량 제한 (설정 파일이 없을 때만 추가하고 journald 재시작)
+limit_journal_size() {
+    local max_use=${1:-200M}
+    local conf=/etc/systemd/journald.conf.d/size.conf
+
+    command -v journalctl >/dev/null 2>&1 || return 0
+
+    if [ ! -f "$conf" ]; then
+        mkdir -p "$(dirname "$conf")"
+        printf '[Journal]\nSystemMaxUse=%s\n' "$max_use" > "$conf"
+        systemctl restart systemd-journald
+        log_info "저널 최대 용량을 $max_use 로 설정했습니다: $conf"
+    fi
+
+    journalctl --vacuum-size="$max_use" 2>&1 | tail -1
+}
+
+# VS Code Server 옛 버전 정리. 사용자별로 최신 버전 2개만 남기고, 실행 중인 버전은 건드리지 않는다.
+remove_old_vscode_servers() {
+    local servers dir
+
+    for servers in /home/*/.vscode-server/cli/servers /root/.vscode-server/cli/servers; do
+        [ -d "$servers" ] || continue
+
+        ls -1dt "$servers"/Stable-* 2>/dev/null | tail -n +3 | while read -r dir; do
+            if pgrep -f "$(basename "$dir")" >/dev/null 2>&1; then
+                log_info "실행 중인 VS Code Server는 유지: $dir"
+                continue
+            fi
+            log_info "VS Code Server 옛 버전 삭제: $dir"
+            rm -rf -- "$dir"
+        done
+    done
+}
+
 # 스크립트 실행 디렉토리
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -539,6 +671,13 @@ fi
 log_info "Step 5: 시스템 정리"
 apt autoremove -y
 apt autoclean -y
+
+purge_old_kernels || log_warn "오래된 커널 제거가 완료되지 않았습니다. 계속 진행합니다."
+purge_residual_kernel_configs || log_warn "커널 잔여 설정 정리 중 오류가 발생했습니다."
+remove_orphan_kernel_modules
+remove_disabled_snap_revisions
+limit_journal_size 200M || log_warn "저널 정리 중 오류가 발생했습니다."
+remove_old_vscode_servers
 log_info "시스템 정리 완료"
 
 # 6. 재부팅 필요 여부 확인
