@@ -6,6 +6,13 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# Docker 컨테이너 로그 크기 제한 (컨테이너를 (재)생성할 때 적용, json-file/local 드라이버 기준)
+#   DOCKER_LOG_MAX_SIZE: 로그 파일 하나의 최대 크기 (예: 10m, 50m, 1g). 0이면 제한을 적용하지 않음
+#   DOCKER_LOG_MAX_FILE: 로테이션으로 보관할 로그 파일 개수
+# 환경변수로 덮어쓸 수 있다. 예: sudo DOCKER_LOG_MAX_SIZE=50m DOCKER_LOG_MAX_FILE=5 ./ubuntu-update.sh
+DOCKER_LOG_MAX_SIZE="${DOCKER_LOG_MAX_SIZE:-10m}"
+DOCKER_LOG_MAX_FILE="${DOCKER_LOG_MAX_FILE:-3}"
+
 # 로그 함수
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
@@ -17,6 +24,47 @@ log_warn() {
 
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# 목록 파일(compose-list.txt, git-list.txt)에서 유효한 항목(한 줄에 경로 하나)만 출력
+# CR 제거, 앞뒤 공백 제거, 빈 줄과 #으로 시작하는 주석 줄은 제외
+read_list_entries() {
+    local line
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        printf '%s\n' "$line"
+    done < "$1"
+}
+
+# 디렉토리의 Git 저장소를 현재 브랜치 기준으로 pull (fast-forward만 허용)
+# 무인 실행 중 병합 커밋이 생기거나 충돌 상태로 남지 않도록 하고, 실패하면 경고만 남긴다.
+# 반환: 0=성공, 1=실패 (브랜치 감지 불가 / detached HEAD / pull 실패)
+git_pull_repo() {
+    local dir=$1
+    local branch
+
+    branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    if [ -z "$branch" ]; then
+        log_warn "현재 브랜치 정보를 얻을 수 없어 git pull을 건너뜁니다: $dir"
+        return 1
+    fi
+    if [ "$branch" = "HEAD" ]; then
+        log_warn "detached HEAD 상태라 git pull을 건너뜁니다: $dir"
+        return 1
+    fi
+
+    log_info "Git 저장소 발견 (브랜치: $branch). 최신 커밋을 가져옵니다..."
+    # stdin을 닫아 목록을 읽는 루프의 입력을 소비하거나 자격 증명 프롬프트에서 멈추는 일을 방지
+    if GIT_TERMINAL_PROMPT=0 git -C "$dir" pull --ff-only origin "$branch" < /dev/null; then
+        log_info "Git pull 성공: $dir (브랜치: $branch)"
+    else
+        log_warn "Git pull 실패 (fast-forward 불가·충돌·네트워크/인증 문제): $dir (브랜치: $branch). 계속 진행합니다. (상세: $RUN_LOG)"
+        return 1
+    fi
 }
 
 # Docker 컨테이너 헬스체크 대기 함수
@@ -111,6 +159,102 @@ wait_for_healthy() {
     log_warn "최대 대기 시간(${max_wait}초) 초과. 현재 상태:"
     echo -e "$status_info"
     return 1
+}
+
+# 컨테이너 로그 크기 제한 사용 여부 판단 및 준비. 결과는 LOG_LIMIT_ENABLED(true/false)에 저장한다.
+# 설정이 잘못됐거나 기본 로깅 드라이버가 json-file/local이 아니면 제한 없이 기존 방식대로 진행한다.
+init_docker_log_limit() {
+    local driver
+    LOG_LIMIT_ENABLED=false
+
+    if [ "$DOCKER_LOG_MAX_SIZE" = "0" ]; then
+        log_info "Docker 로그 크기 제한: 사용 안 함 (DOCKER_LOG_MAX_SIZE=0)"
+        return 0
+    fi
+
+    if ! [[ "$DOCKER_LOG_MAX_SIZE" =~ ^[1-9][0-9]*[kKmMgG]?$ ]] || ! [[ "$DOCKER_LOG_MAX_FILE" =~ ^[1-9][0-9]*$ ]]; then
+        log_warn "DOCKER_LOG_MAX_SIZE='$DOCKER_LOG_MAX_SIZE' / DOCKER_LOG_MAX_FILE='$DOCKER_LOG_MAX_FILE' 형식이 올바르지 않아 로그 크기 제한을 적용하지 않습니다. (예: 10m / 3)"
+        return 0
+    fi
+
+    # 드라이버를 지정하지 않고 옵션만 주입하므로, 기본 드라이버가 max-size/max-file을 지원해야 한다
+    driver=$(docker info --format '{{.LoggingDriver}}' 2>/dev/null)
+    case "$driver" in
+        json-file|local) ;;
+        *)
+            log_warn "Docker 기본 로깅 드라이버가 '${driver:-확인 불가}'이라 로그 크기 제한을 적용하지 않습니다."
+            return 0
+            ;;
+    esac
+
+    LOG_OVERRIDE_DIR=$(mktemp -d) || {
+        log_warn "임시 디렉토리 생성 실패. 로그 크기 제한을 적용하지 않습니다."
+        return 0
+    }
+    trap 'rm -rf "$LOG_OVERRIDE_DIR"' EXIT
+
+    LOG_LIMIT_ENABLED=true
+    log_info "Docker 로그 크기 제한: max-size=$DOCKER_LOG_MAX_SIZE, max-file=$DOCKER_LOG_MAX_FILE (compose에 logging이 없는 서비스에만 적용)"
+}
+
+# compose 파일에서 logging이 정의되지 않은 서비스에 로그 크기 제한을 주입하는 override 파일을 생성한다.
+# compose 파일에 logging이 이미 있는 서비스는 그 설정을 존중하여 건드리지 않는다.
+# 반드시 compose 디렉토리로 이동한 뒤 호출할 것 (-f 없이 docker compose가 찾는 파일과 비교하기 때문).
+# 반환: 0=override 생성 (docker compose -f <compose_path> -f <out> 으로 사용), 1=주입하지 않음
+build_log_limit_override() {
+    local compose_path=$1
+    local out=$2
+    local explicit_cfg default_cfg line svc
+    local -a applied=() kept=()
+
+    explicit_cfg=$(docker compose -f "$compose_path" config 2>/dev/null) || return 1
+
+    # pull/down/up은 -f 없이 실행되어 docker-compose.override.yml 이나 COMPOSE_FILE 도 함께 읽는다.
+    # 그 결과가 compose_path 단독 결과와 다르면 -f 로 고정할 때 동작이 달라지므로 주입하지 않는다.
+    default_cfg=$(docker compose config 2>/dev/null) || default_cfg=""
+    if [ "$explicit_cfg" != "$default_cfg" ]; then
+        log_warn "docker compose 기본 탐색 결과가 목록의 파일과 달라(override 파일 또는 COMPOSE_FILE 사용 추정) 로그 크기 제한을 주입하지 않습니다. 필요하면 해당 compose 파일에 logging을 직접 지정하세요."
+        return 1
+    fi
+
+    # 서비스별 logging 정의 여부 분류: "+서비스" = 주입 대상, "=서비스" = 기존 설정 유지
+    while IFS= read -r line; do
+        case "$line" in
+            +*) applied+=("${line#+}") ;;
+            =*) kept+=("${line#=}") ;;
+        esac
+    done < <(printf '%s\n' "$explicit_cfg" | awk '
+        /^services:/ { in_services=1; next }
+        in_services && /^[^ #]/ { in_services=0 }
+        !in_services { next }
+        /^  [^ ]/ { svc=$1; gsub(/[\047":]/, "", svc); order[n++]=svc; next }
+        /^    logging:/ { has_logging[svc]=1 }
+        END { for (i = 0; i < n; i++) print (has_logging[order[i]] ? "=" : "+") order[i] }')
+
+    if [ ${#kept[@]} -gt 0 ]; then
+        log_info "기존 logging 설정 유지: ${kept[*]}"
+    fi
+    if [ ${#applied[@]} -eq 0 ]; then
+        return 1
+    fi
+
+    {
+        echo "services:"
+        for svc in "${applied[@]}"; do
+            printf '  "%s":\n    logging:\n      options:\n        max-size: "%s"\n        max-file: "%s"\n' \
+                "$svc" "$DOCKER_LOG_MAX_SIZE" "$DOCKER_LOG_MAX_FILE"
+        done
+    } > "$out"
+
+    # 생성한 override가 유효한지 확인. 문제가 있으면 쓰지 않고 기존 방식대로 진행한다.
+    if ! docker compose -f "$compose_path" -f "$out" config -q >/dev/null 2>&1; then
+        log_warn "로그 크기 제한 override가 유효하지 않아 적용하지 않습니다: $compose_path"
+        rm -f -- "$out"
+        return 1
+    fi
+
+    log_info "로그 크기 제한 적용 (max-size=$DOCKER_LOG_MAX_SIZE, max-file=$DOCKER_LOG_MAX_FILE): ${applied[*]}"
+    return 0
 }
 
 # dpkg/apt 자동 복구에 사용하는 공통 옵션
@@ -489,27 +633,71 @@ fi
 
 echo ""
 
-# 1. Docker Compose 이미지 업데이트
-log_info "Step 1: Docker Compose 이미지 업데이트 시작"
+# 1. Git 저장소 업데이트 (docker compose와 무관하게 git pull이 필요한 폴더 목록)
+# git-list.txt 형식: 한 줄에 저장소 폴더의 절대 경로 하나, 빈 줄과 #으로 시작하는 줄은 무시
+# Docker 단계보다 먼저 실행하여 빌드/마운트되는 소스가 최신 상태로 컨테이너가 재시작되도록 한다.
+log_info "Step 1: Git 저장소 업데이트"
+
+GIT_LIST="$SCRIPT_DIR/git-list.txt"
+
+if [ -f "$GIT_LIST" ]; then
+    log_info "git-list.txt에서 경로 목록을 읽어옵니다..."
+
+    GIT_SUCCESS_COUNT=0
+    GIT_FAIL_COUNT=0
+    GIT_TOTAL_COUNT=0
+
+    while IFS= read -r git_dir; do
+        GIT_TOTAL_COUNT=$((GIT_TOTAL_COUNT + 1))
+        log_info "[$GIT_TOTAL_COUNT] 처리 중: $git_dir"
+
+        if [ ! -d "$git_dir" ]; then
+            log_warn "디렉토리를 찾을 수 없습니다: $git_dir"
+            GIT_FAIL_COUNT=$((GIT_FAIL_COUNT + 1))
+            continue
+        fi
+
+        if [ ! -e "$git_dir/.git" ]; then
+            log_warn "Git 저장소의 최상위 폴더가 아닙니다 (.git 없음): $git_dir"
+            GIT_FAIL_COUNT=$((GIT_FAIL_COUNT + 1))
+            continue
+        fi
+
+        if git_pull_repo "$git_dir"; then
+            GIT_SUCCESS_COUNT=$((GIT_SUCCESS_COUNT + 1))
+        else
+            GIT_FAIL_COUNT=$((GIT_FAIL_COUNT + 1))
+        fi
+    done < <(read_list_entries "$GIT_LIST")
+
+    log_info "Git 저장소 업데이트 완료 - 성공: $GIT_SUCCESS_COUNT, 실패: $GIT_FAIL_COUNT, 전체: $GIT_TOTAL_COUNT"
+
+    if [ $GIT_FAIL_COUNT -gt 0 ]; then
+        log_warn "일부 Git 저장소 업데이트가 실패했습니다."
+    fi
+else
+    log_info "git-list.txt 파일이 없습니다. Git 저장소 업데이트를 건너뜁니다."
+fi
+
+echo ""
+
+# 2. Docker Compose 이미지 업데이트
+log_info "Step 2: Docker Compose 이미지 업데이트 시작"
 
 COMPOSE_LIST="$SCRIPT_DIR/compose-list.txt"
 
 if [ -f "$COMPOSE_LIST" ]; then
     log_info "compose-list.txt에서 경로 목록을 읽어옵니다..."
 
+    # 컨테이너 로그 크기 제한 준비
+    init_docker_log_limit
+
     # 성공/실패 카운터
     SUCCESS_COUNT=0
     FAIL_COUNT=0
     TOTAL_COUNT=0
 
-    while IFS= read -r compose_path || [ -n "$compose_path" ]; do
-        # CR 제거 및 양끝 공백 제거
-        compose_path="${compose_path%$'\r'}"
-        compose_path="$(echo "$compose_path" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-
-        # 빈 줄이나 주석(#으로 시작) 건너뛰기
-        [[ -z "$compose_path" || "$compose_path" =~ ^[[:space:]]*# ]] && continue
-
+    while IFS= read -r compose_path; do
         TOTAL_COUNT=$((TOTAL_COUNT + 1))
         COMPOSE_DIR="$(dirname "$compose_path")"
 
@@ -532,16 +720,16 @@ if [ -f "$COMPOSE_LIST" ]; then
 
         # 해당 디렉토리에 Git 저장소가 있으면 현재 브랜치로 pull 시도
         if [ -d "$COMPOSE_DIR/.git" ]; then
-            branch=$(git -C "$COMPOSE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-            if [ -n "$branch" ]; then
-                log_info "Git 저장소 발견 (브랜치: $branch). 최신 커밋을 가져옵니다..."
-                if git -C "$COMPOSE_DIR" pull origin "$branch"; then
-                    log_info "Git pull 성공: $COMPOSE_DIR (브랜치: $branch)"
-                else
-                    log_warn "Git pull 실패 또는 충돌 필요: $COMPOSE_DIR (브랜치: $branch). 계속 진행합니다. (상세: $RUN_LOG)"
-                fi
-            else
-                log_warn "현재 브랜치 정보를 얻을 수 없어 git pull을 건너뜁니다: $COMPOSE_DIR"
+            git_pull_repo "$COMPOSE_DIR" || true   # 실패해도 기존 이미지/소스로 계속 진행
+        fi
+
+        # 컨테이너 로그 크기 제한 주입 (pull로 compose 파일이 바뀔 수 있으므로 pull 이후에 생성)
+        # 주입할 수 없으면 기존과 동일하게 -f 없이 docker compose를 실행한다.
+        COMPOSE_CMD=(docker compose)
+        if [ "$LOG_LIMIT_ENABLED" = true ]; then
+            LOG_OVERRIDE_FILE="$LOG_OVERRIDE_DIR/log-limit-$TOTAL_COUNT.yml"
+            if build_log_limit_override "$compose_path" "$LOG_OVERRIDE_FILE"; then
+                COMPOSE_CMD=(docker compose -f "$compose_path" -f "$LOG_OVERRIDE_FILE")
             fi
         fi
 
@@ -584,9 +772,9 @@ if [ -f "$COMPOSE_LIST" ]; then
         fi
 
         log_info "최신 이미지 다운로드 중..."
-        if docker compose pull; then
+        if "${COMPOSE_CMD[@]}" pull; then
             log_info "컨테이너 재시작 중..."
-            if docker compose down && docker compose up -d; then
+            if "${COMPOSE_CMD[@]}" down && "${COMPOSE_CMD[@]}" up -d; then
                 # 컨테이너 초기화 대기
                 if wait_for_healthy "$compose_path" "$RUN_LOG"; then
                     log_info "업데이트 완료: $compose_path"
@@ -605,7 +793,7 @@ if [ -f "$COMPOSE_LIST" ]; then
         fi
 
         echo ""
-    done < "$COMPOSE_LIST"
+    done < <(read_list_entries "$COMPOSE_LIST")
 
     # 결과 요약
     log_info "Docker Compose 업데이트 완료 - 성공: $SUCCESS_COUNT, 실패: $FAIL_COUNT, 전체: $TOTAL_COUNT"
@@ -617,8 +805,8 @@ else
     log_warn "compose-list.txt 파일을 찾을 수 없습니다. Docker 업데이트를 건너뜁니다."
 fi
 
-# 2. 사용하지 않는 Docker 이미지 및 빌드 캐시 제거
-log_info "Step 2: 사용하지 않는 Docker 이미지 및 빌드 캐시 제거"
+# 3. 사용하지 않는 Docker 이미지 및 빌드 캐시 제거
+log_info "Step 3: 사용하지 않는 Docker 이미지 및 빌드 캐시 제거"
 if docker image prune -af; then
     log_info "Docker 이미지 정리 완료"
 else
@@ -630,8 +818,8 @@ else
     log_warn "Docker 빌드 캐시 정리 중 오류가 발생했습니다. 상세 로그: $RUN_LOG"
 fi
 
-# 3. APT 업데이트
-log_info "Step 3: APT 패키지 목록 업데이트"
+# 4. APT 업데이트
+log_info "Step 4: APT 패키지 목록 업데이트"
 if apt update; then
     log_info "APT 업데이트 완료"
 else
@@ -639,8 +827,8 @@ else
     exit 1
 fi
 
-# 4. APT 업그레이드
-log_info "Step 4: APT 패키지 업그레이드"
+# 5. APT 업그레이드
+log_info "Step 5: APT 패키지 업그레이드"
 
 # 이전 실행 등으로 dpkg 상태가 깨져 있으면 업그레이드 전에 복구
 if ! repair_dpkg; then
@@ -667,8 +855,8 @@ else
     fi
 fi
 
-# 5. 불필요한 패키지 제거 및 캐시 정리
-log_info "Step 5: 시스템 정리"
+# 6. 불필요한 패키지 제거 및 캐시 정리
+log_info "Step 6: 시스템 정리"
 apt autoremove -y
 apt autoclean -y
 
@@ -680,8 +868,8 @@ limit_journal_size 200M || log_warn "저널 정리 중 오류가 발생했습니
 remove_old_vscode_servers
 log_info "시스템 정리 완료"
 
-# 6. 재부팅 필요 여부 확인
-log_info "Step 6: 재부팅 필요 여부 확인"
+# 7. 재부팅 필요 여부 확인
+log_info "Step 7: 재부팅 필요 여부 확인"
 if [ -f /var/run/reboot-required ]; then
     log_warn "시스템 재부팅이 필요합니다."
     # 분리 실행 중에는 터미널의 Ctrl+C가 워커에 전달되지 않으므로 kill로 취소해야 한다.
