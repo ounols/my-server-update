@@ -462,18 +462,37 @@ purge_residual_kernel_configs() {
     dpkg --purge "${residual[@]}" >/dev/null
 }
 
-# 어떤 패키지에도 속하지 않는 /lib/modules/<버전> 디렉토리 삭제 (실행 중인 커널은 제외)
+# 어떤 패키지에도 속하지 않는 /lib/modules/<버전> 디렉토리 삭제
+# 제외 대상: 실행 중인 커널, /boot 에 커널 이미지가 남아 있는(설치됐거나 재부팅 대기 중인) 커널
+#
+# merged-/usr 환경(/lib -> usr/lib)에서도 dpkg -S 는 패키지가 기록한 경로와 정확히 일치해야만 매치된다.
+#   - Debian : 커널 패키지가 /usr/lib/modules/<버전> 으로 기록 -> /lib/modules/... 로 조회하면 실패
+#   - Ubuntu : 커널 패키지가 /lib/modules/<버전> 으로 기록     -> /usr/lib/modules/... 로 조회하면 실패
+# 한쪽 경로만 조회하면 새로 설치한 커널의 모듈 디렉토리까지 고아로 오인해 삭제하게 되므로
+# 두 경로를 모두 조회한다.
 remove_orphan_kernel_modules() {
-    local dir name
+    local dir name real path owned
 
     for dir in /lib/modules/*/; do
         dir="${dir%/}"
+        [ -d "$dir" ] || continue
         name="$(basename "$dir")"
-        [ "$name" = "$(uname -r)" ] && continue
-        dpkg -S "$dir" >/dev/null 2>&1 && continue
 
-        log_info "패키지 없이 남은 모듈 디렉토리 삭제: $dir"
-        rm -rf -- "$dir"
+        [ "$name" = "$(uname -r)" ] && continue
+        [ -e "/boot/vmlinuz-$name" ] && continue
+
+        owned=0
+        for path in "/lib/modules/$name" "/usr/lib/modules/$name"; do
+            if dpkg -S "$path" >/dev/null 2>&1; then
+                owned=1
+                break
+            fi
+        done
+        [ "$owned" -eq 1 ] && continue
+
+        real="$(readlink -f "$dir")"
+        log_info "패키지 없이 남은 모듈 디렉토리 삭제: $real"
+        rm -rf -- "$real"
     done
 }
 
