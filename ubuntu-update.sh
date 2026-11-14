@@ -40,16 +40,69 @@ read_list_entries() {
     done < "$1"
 }
 
+# 사용자 취소(Ctrl+C=SIGINT, kill=SIGTERM) 처리: 남은 단계를 진행하지 않고 종료한다.
+# bash는 포그라운드 명령(git pull 등)이 끝난 직후 트랩을 실행하므로, 취소로 중단된 명령이
+# "실패 → 경고 후 계속 진행" 분기로 넘어가기 전에 여기서 종료된다. EXIT 트랩(임시 파일 정리)은 그대로 실행된다.
+handle_cancel() {
+    trap '' INT TERM   # 종료 정리 중에 들어오는 중복 신호는 무시
+    echo ""
+    log_warn "사용자 요청으로 작업을 취소했습니다. 남은 단계는 진행하지 않습니다."
+    exit "${1:-130}"
+}
+
+# pull을 이미 시도한 저장소(최상위 경로) 기록. 같은 저장소를 git-list와 여러 compose 폴더에서 중복 pull하지 않기 위함
+declare -A GIT_PULLED_REPOS=()
+
+# 디렉토리가 속한 Git 작업 트리의 최상위 경로를 GIT_TOPLEVEL에 저장한다 (하위 폴더, .git이 파일인 worktree/submodule 포함).
+# 반환: 0=저장소 안, 1=저장소 아님(조용히 건너뜀), 2=확인 실패 (소유권 문제 등. 사유를 경고로 출력)
+# 서브셸 없이 호출해야 한다 ($(...) 안에서는 경고 출력이 결과에 섞인다).
+find_git_toplevel() {
+    local dir=$1 out
+    GIT_TOPLEVEL=""
+
+    # LC_ALL=C: 로케일에 따라 달라지는 git 메시지를 안정적으로 판별
+    if out=$(LC_ALL=C git -C "$dir" rev-parse --show-toplevel 2>&1); then
+        GIT_TOPLEVEL=$out
+        return 0
+    fi
+    [[ "$out" == *"not a git repository"* ]] && return 1
+
+    log_warn "Git 저장소 여부를 확인할 수 없어 git pull을 건너뜁니다: $dir ($out)"
+    return 2
+}
+
+# compose 파일이 있는 폴더가 Git 저장소(의 하위 폴더 포함)이면 해당 저장소를 pull 시도한다.
+# 저장소가 아니거나 pull이 실패해도 호출자는 기존 이미지/소스로 계속 진행한다. (사용자 취소만 예외로 중단)
+pull_compose_repo() {
+    local dir=$1
+    local rc=0
+
+    find_git_toplevel "$dir" || rc=$?
+    case "$rc" in
+        0) git_pull_repo "$GIT_TOPLEVEL" || true ;;
+        1) log_info "Git 저장소가 아니어서 git pull을 건너뜁니다: $dir" ;;
+    esac
+    return 0
+}
+
 # 디렉토리의 Git 저장소를 현재 브랜치 기준으로 pull (fast-forward만 허용)
 # 무인 실행 중 병합 커밋이 생기거나 충돌 상태로 남지 않도록 하고, 실패하면 경고만 남긴다.
+# 같은 저장소를 이미 시도했으면 건너뛴다 (성공으로 간주).
 # 반환: 0=성공, 1=실패 (브랜치 감지 불가 / detached HEAD / pull 실패)
 git_pull_repo() {
     local dir=$1
-    local branch
+    local branch key
 
-    branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-    if [ -z "$branch" ]; then
-        log_warn "현재 브랜치 정보를 얻을 수 없어 git pull을 건너뜁니다: $dir"
+    key=$(cd "$dir" 2>/dev/null && pwd -P) || key=$dir
+    if [ -n "${GIT_PULLED_REPOS[$key]:-}" ]; then
+        log_info "이미 pull을 시도한 저장소라 건너뜁니다: $dir"
+        return 0
+    fi
+    GIT_PULLED_REPOS["$key"]=1
+
+    # 실패 사유(dubious ownership 등)가 경고에 보이도록 stderr도 함께 받는다
+    if ! branch=$(LC_ALL=C git -C "$dir" rev-parse --abbrev-ref HEAD 2>&1) || [ -z "$branch" ]; then
+        log_warn "현재 브랜치 정보를 얻을 수 없어 git pull을 건너뜁니다: $dir (${branch:-사유 없음})"
         return 1
     fi
     if [ "$branch" = "HEAD" ]; then
@@ -588,10 +641,30 @@ if [ -z "${UPDATE_DETACHED:-}" ] && [ -t 1 ] && command -v setsid >/dev/null 2>&
     WORKER_PID=$!
 
     log_info "작업 PID: $WORKER_PID — 연결이 끊기면 재접속 후 확인: tail -f $RUN_LOG"
+    log_info "작업을 취소하려면 Ctrl+C (SSH 연결이 끊기는 것은 취소가 아니므로 작업은 계속됩니다)"
     echo ""
+
+    # Ctrl+C(SIGINT)만 워커에 전달한다. SSH 끊김(SIGHUP)은 전달하지 않으므로 워커는 계속 실행된다.
+    # 워커는 새 세션의 리더(프로세스 그룹 ID = PID)이므로 그룹 전체(git/docker/apt 등 자식 포함)에 TERM을 보낸다.
+    # INT가 아닌 TERM인 이유: 비대화형 셸이 &로 띄운 워커는 SIGINT가 무시된 상태로 시작되어(자식도 상속) INT로는 멈출 수 없다.
+    # 주의: 워커가 Step 0에서 이 파일을 갱신할 수 있으므로, 이 if 블록 밖의 코드는 실행하지 않고 블록 안에서 끝낸다.
+    CANCELLED=0
+    trap 'CANCELLED=1; kill -TERM -- "-$WORKER_PID" 2>/dev/null' INT
 
     # 워커가 끝날 때까지 로그를 실시간 표시. 이 tail(현재 세션)이 끊겨도 워커는 계속된다.
     tail --pid="$WORKER_PID" -n +1 -f "$RUN_LOG"
+
+    if [ "$CANCELLED" -eq 1 ]; then
+        # 취소로 tail이 먼저 종료되었으므로 워커가 정리되고 끝날 때까지 기다린다 (대기 중 Ctrl+C는 TERM을 다시 전달)
+        echo ""
+        log_warn "취소 요청을 전달했습니다. 진행 중인 작업이 정리될 때까지 기다립니다... (응답이 없으면 다른 터미널에서: sudo kill -9 -- -$WORKER_PID)"
+        while kill -0 "$WORKER_PID" 2>/dev/null; do
+            wait "$WORKER_PID" 2>/dev/null
+        done
+        log_warn "작업이 취소되었습니다. 로그: $RUN_LOG"
+        exit 130
+    fi
+
     wait "$WORKER_PID"
     exit $?
 fi
@@ -605,6 +678,11 @@ fi
 
 log_info "실행 로그: $RUN_LOG"
 
+# 사용자 취소 시 진행을 멈춘다. (Step 0에서 스크립트를 재실행해도 이 지점을 다시 지나므로 트랩이 유지된다)
+#   INT : 터미널에서 직접 실행 중일 때의 Ctrl+C. 분리 실행된 워커는 SIGINT가 무시된 채 시작되어 이 트랩이 동작하지 않는다.
+#   TERM: 분리 실행 시 부모(터미널)가 Ctrl+C를 받아 전달하는 취소 신호, 또는 직접 보낸 kill
+trap 'handle_cancel 130' INT
+trap 'handle_cancel 143' TERM
 
 log_info "=== 시스템 업데이트 스크립트 시작 ==="
 log_info "작업 디렉토리: $SCRIPT_DIR"
@@ -737,10 +815,9 @@ if [ -f "$COMPOSE_LIST" ]; then
         # 실행 통합 로그에 섹션 헤더 추가
         echo "===== $compose_path - $(date '+%Y-%m-%d %H:%M:%S') =====" >> "$RUN_LOG" 2>/dev/null || true
 
-        # 해당 디렉토리에 Git 저장소가 있으면 현재 브랜치로 pull 시도
-        if [ -d "$COMPOSE_DIR/.git" ]; then
-            git_pull_repo "$COMPOSE_DIR" || true   # 실패해도 기존 이미지/소스로 계속 진행
-        fi
+        # compose 파일이 있는 폴더가 Git 저장소(하위 폴더 포함)이면 현재 브랜치로 pull 시도
+        # 실패해도 기존 이미지/소스로 계속 진행하지만, Ctrl+C 취소는 handle_cancel이 여기서 전체를 중단한다.
+        pull_compose_repo "$COMPOSE_DIR"
 
         # 컨테이너 로그 크기 제한 주입 (pull로 compose 파일이 바뀔 수 있으므로 pull 이후에 생성)
         # 주입할 수 없으면 기존과 동일하게 -f 없이 docker compose를 실행한다.
@@ -891,8 +968,8 @@ log_info "시스템 정리 완료"
 log_info "Step 7: 재부팅 필요 여부 확인"
 if [ -f /var/run/reboot-required ]; then
     log_warn "시스템 재부팅이 필요합니다."
-    # 분리 실행 중에는 터미널의 Ctrl+C가 워커에 전달되지 않으므로 kill로 취소해야 한다.
-    log_info "10초 후 자동으로 재부팅됩니다... (취소하려면: sudo kill $$)"
+    # 원래 터미널에서는 Ctrl+C로 취소된다. 연결이 끊겨 재접속한 경우에는 kill로 취소해야 한다.
+    log_info "10초 후 자동으로 재부팅됩니다... (취소하려면: Ctrl+C, 재접속했다면: sudo kill $$)"
 
     for i in {10..1}; do
         echo "재부팅까지 ${i}초 남음..."
